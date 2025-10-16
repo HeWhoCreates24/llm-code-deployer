@@ -2,13 +2,14 @@ import base64
 import os
 import re
 import time
+import random
 import tempfile
 import subprocess
 from pathlib import Path
 from typing import Any, Dict
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 
@@ -395,32 +396,45 @@ def pages_url(repo: str) -> str:
 
 
 # ---------- Notify ----------
-def notify(eval_url: str, payload: JSONDict) -> None:
-    """POST results to evaluation_url with exponential backoff until 200 or fail."""
-    backoff = 1
+RETRYABLE = {429, 500, 502, 503, 504}
+
+def notify(eval_url: str, payload: JSONDict, max_elapsed_sec: int = 600, first_delay: float = 1.0) -> bool:
+    """Try to send the evaluation notification.
+
+    Returns True if a 200 was received. Retries with exponential backoff + jitter
+    for up to max_elapsed_sec.
+    """
+    deadline = time.time() + max_elapsed_sec
+    delay = first_delay
     last_status: Any = None
     last_text = ""
-    for _ in range(6):
+
+    while time.time() < deadline:
         try:
             r = requests.post(
                 eval_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=HTTP_TIMEOUT,
+                timeout=10,
             )
-            last_status, last_text = r.status_code, r.text
             if r.status_code == 200:
-                return
+                return True
+            last_status, last_text = r.status_code, (r.text or "")
+            if r.status_code not in RETRYABLE:
+                break
         except Exception as e:
-            last_status, last_text = "exception", str(e)
-        time.sleep(backoff)
-        backoff *= 2
-    raise RuntimeError(f"Notify failed: {last_status} {last_text}")
+            last_status, last_text = "EXC", str(e)
+
+        time.sleep(delay + random.uniform(0, 0.5))
+        delay = min(delay * 2, 60)
+
+    # Could log last_status/last_text here
+    return False
 
 
 # ---------- Endpoint ----------
 @app.post("/task")
-async def handle(request: Request):
+async def handle(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     assert_secret(body)
 
@@ -476,17 +490,19 @@ async def handle(request: Request):
 
     purl = pages_url(repo)
 
-    notify(
-        eval_url,
-        {
-            "email": email,
-            "task": task,
-            "round": round_idx,
-            "nonce": nonce,
-            "repo_url": f"https://github.com/{GITHUB_USERNAME}/{repo}",
-            "commit_sha": commit_sha,
-            "pages_url": purl,
-        },
-    )
+    payload = {
+        "email": email,
+        "task": task,
+        "round": round_idx,
+        "nonce": nonce,
+        "repo_url": f"https://github.com/{GITHUB_USERNAME}/{repo}",
+        "commit_sha": commit_sha,
+        "pages_url": purl,
+    }
 
-    return JSONResponse({"ok": True, "repo": repo, "commit": commit_sha, "pages_url": purl})
+    # Fast path: try once synchronously (up to ~5s). If not OK, retry in background up to 10 minutes.
+    notified = notify(eval_url, payload, max_elapsed_sec=5, first_delay=1.0)
+    if not notified:
+        background_tasks.add_task(notify, eval_url, payload, 600, 1.0)
+
+    return JSONResponse({"ok": True, "repo": repo, "commit": commit_sha, "pages_url": purl, "notified": notified})
