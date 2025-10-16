@@ -1,0 +1,20 @@
+{
+  "name": "llm-code-deployer",
+  "version": "1.0.0",
+  "description": "Node.js service that generates static apps from briefs, commits to GitHub, deploys to Pages, and notifies an evaluator.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.1.1",
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
+
