@@ -1,18 +1,17 @@
 {
-  "email": "student@example.com",
+  "email": "tanmayhatkar240@gmail.com",
   "secret": "my_secret",
-  "task": "captcha-solver-localtest",
-  "round": 1,
+  "task": "snake-game-localtest",
+  "round": 2,
   "nonce": "n-local-001",
-  "brief": "Create a captcha solver that handles ?url=https://.../image.png. Default to attached sample.",
+  "brief": "Make the theme dark and modern with gradient colors.",
   "checks": [
-    "Repo has MIT license",
-    "README.md is professional",
-    "Page displays captcha URL passed at ?url=...",
-    "Page displays solved captcha text within 15 seconds"
+    "background is dark themed",
+    "snake is gradient colored, purple to blue",
+    "fruits are randomly colored",
+    "fruits are circular in shape",
+    "fruits are distinguishable from the snake",
+    "buttons are modern and minimalistic, with hover effects"
   ],
-  "evaluation_url": "https://httpbin.org/status/200",
-  "attachments": [
-    { "name": "sample.png", "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA" }
-  ]
+  "evaluation_url": "https://httpbin.org/status/200"
 }

@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 from typing import Any, Dict
+import json
 
 import requests
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -20,6 +21,11 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
 GITHUB_EMAIL = os.getenv("GITHUB_EMAIL", "")
 GITHUB_PAT = os.getenv("GITHUB_PAT", "")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "")
+
+# Optional LLM gateway (OpenAI-compatible)
+API_KEY = os.getenv("API_KEY", "")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://aipipe.org/openai/v1")
+API_MODEL = os.getenv("API_MODEL", "gpt-4o-mini")
 
 API_HEADERS = {
     "Accept": "application/vnd.github+json",
@@ -103,12 +109,7 @@ def write_file(repo_dir: Path, rel: str, content: str | bytes) -> None:
         p.write_text(content, encoding="utf-8")
 
 
-def fill_tokens(template: str, tokens: Dict[str, str]) -> str:
-    """Replace %%TOKEN%% placeholders in template with string values from tokens."""
-    out = template
-    for k, v in tokens.items():
-        out = out.replace(f"%%{k}%%", v)
-    return out
+# No template token filler needed; we now rely on the LLM for HTML.
 
 
 MIT = (
@@ -190,7 +191,7 @@ GITLEAKS = (
 )
 
 
-# ---------- Generators ----------
+# ---------- Attachments ----------
 def decode_attachments(attachments: list[Dict[str, str]] | None) -> Dict[str, bytes]:
     """Decode data: URLs in attachments into a mapping name->bytes."""
     out: Dict[str, bytes] = {}
@@ -209,183 +210,252 @@ def decode_attachments(attachments: list[Dict[str, str]] | None) -> Dict[str, by
     return out
 
 
-def gen_sum_of_sales(seed: str, csv_bytes: bytes, total: float) -> str:
-    """Sales template; computes total in-page and writes into #total-sales."""
-    tot_str = f"{total:.2f}"
-    tpl = """
-<!doctype html><meta charset=utf-8>
-<title>Sales Summary %%SEED%%</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5/dist/css/bootstrap.min.css">
-<div class="container py-4">
-  <h1>Sales Summary %%SEED%%</h1>
-  <p>Total: <span id="total-sales">%%TOTAL%%</span></p>
-  <div id="product-sales" class="d-none"></div>
-  <div id="region-sales" class="d-none"></div>
-  <div id="downloads-status" class="visually-hidden" aria-live="polite"></div>
-  <div id="alerts" class="d-none"></div>
-  <div id="tabs" class="d-none"></div>
-  <div id="filters" class="d-none"></div>
-  <div id="currency" class="d-none"></div>
-  <div id="line-charts" class="d-none"></div>
-  <div id="bar-charts" class="d-none"></div>
-  <div id="pie-charts" class="d-none"></div>
-  <div id="download-summary" class="d-none"></div>
-  <div id="toast" class="d-none"></div>
-  <div id="bootstrap-components" class="d-none"></div>
-</div>
-<script>
-// csv embedded for static use
-const csv = atob("%%BASE64%%");
-const total = csv.trim().split(/\n/).slice(1).reduce((a,line)=>{const v=parseFloat(line.split(',').pop());return a+(isNaN(v)?0:v);},0);
-document.querySelector('#total-sales').textContent = total.toFixed(2);
-</script>
-"""
-    return fill_tokens(
-        tpl,
-        {
-            "SEED": seed,
-            "TOTAL": tot_str,
-            "BASE64": base64.b64encode(csv_bytes).decode("ascii"),
-        },
-    )
+# ---------- LLM-backed generator ----------
+def _extract_html(text: str) -> str:
+    """Strip Markdown code fences and return raw HTML string."""
+    if not text:
+        return ""
+    t = text.strip()
+    # Remove ```html ... ``` or ``` ... ``` fences if present
+    if t.startswith("```"):
+        # find first newline after opening fence
+        first_nl = t.find("\n")
+        if first_nl != -1:
+            t = t[first_nl + 1 :]
+        if t.endswith("```"):
+            t = t[:-3]
+    return t.strip()
 
 
-def gen_markdown_to_html(md_bytes: bytes) -> str:
-    """Markdown template using marked + highlight.js; supports ?url= fallback."""
-    tpl = """
-<!doctype html><meta charset=utf-8>
-<title>Markdown</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5/dist/css/bootstrap.min.css">
-<div class="container py-4">
-  <div id="markdown-output"></div>
-  <pre id="markdown-source" class="d-none"></pre>
-  <span id="markdown-source-label"></span>
-  <span id="markdown-word-count"></span>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/highlight.js/lib/common.min.js"></script>
-<script>
-const params=new URLSearchParams(location.search);
-const fallback = atob("%%BASE64%%");
-async function load(){
-  let srcLabel='attachment', text=fallback;
-  if (params.has('url')) { try { const r=await fetch(params.get('url')); text=await r.text(); srcLabel=params.get('url'); } catch{} }
-  document.getElementById('markdown-source-label').textContent = srcLabel;
-  document.getElementById('markdown-source').textContent = text;
-  document.getElementById('markdown-output').innerHTML = marked.parse(text);
-  const words = (text.match(/\S+/g)||[]).length; document.getElementById('markdown-word-count').textContent = new Intl.NumberFormat().format(words);
-}
-load();
-</script>
-"""
-    return fill_tokens(tpl, {"BASE64": base64.b64encode(md_bytes).decode("ascii")})
+def _normalize_checks(checks: Any) -> list[str]:
+    """Normalize request checks into concise strings for the LLM prompt."""
+    out: list[str] = []
+    if isinstance(checks, (list, tuple)):
+        for c in checks:
+            if isinstance(c, str):
+                s = c
+            elif isinstance(c, dict):
+                try:
+                    s = json.dumps(c, ensure_ascii=False, separators=(",", ":"))
+                except Exception:
+                    s = str(c)
+            else:
+                s = str(c)
+            s = s.strip()
+            if s:
+                out.append(s[:800])
+            if len(out) >= 40:
+                break
+    return out
 
 
-def gen_github_user(seed: str) -> str:
-    """GitHub user lookup template; writes created_at and account age."""
-    tpl = """
-<!doctype html><meta charset=utf-8>
-<title>GitHub User %%SEED%%</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5/dist/css/bootstrap.min.css">
-<form id="github-user-%%SEED%%" class="container py-4">
-  <input class="form-control" name="u" placeholder="octocat" required>
-  <button class="btn btn-primary mt-2">Lookup</button>
-  <div id="github-status" aria-live="polite" class="mt-2"></div>
-  <div class="mt-2">Created: <span id="github-created-at"></span> · <span id="github-account-age"></span></div>
-  <div class="d-none" id="github-cache"></div>
-</form>
-<script>
-const form=document.getElementById('github-user-%%SEED%%');
-form.addEventListener('submit', async (e)=>{
-  e.preventDefault(); const u=new FormData(form).get('u');
-  const status=document.getElementById('github-status'); status.textContent='Starting…';
-  try {
-    const token=new URLSearchParams(location.search).get('token');
-    const r=await fetch('https://api.github.com/users/'+u, { headers: token?{Authorization:'token '+token}:{}});
-    status.textContent = r.ok? 'Success' : 'Failed';
-    const j=await r.json(); const dt=new Date(j.created_at);
-    const y = Math.max(0, Math.floor((Date.now()-dt.getTime())/31557600000));
-    document.getElementById('github-created-at').textContent = dt.toISOString().slice(0,10);
-    document.getElementById('github-account-age').textContent = y+' years';
-    localStorage.setItem('github-user-%%SEED%%', u);
-  } catch(e){ status.textContent='Failed'; }
-});
-window.addEventListener('load',()=>{ const last=localStorage.getItem('github-user-%%SEED%%'); if(last) form.querySelector('[name=u]').value=last; });
-</script>
-"""
-    return fill_tokens(tpl, {"SEED": seed})
+def build_llm_prompt(task: str, brief: str, seed: str, attachments: dict[str, bytes], checks: Any | None = None) -> str:
+    """Construct a concise, explicit prompt for generating a static HTML page.
 
+    The prompt covers known templates (markdown, sales, github-user, captcha) and
+    instructs the model to emit a single self-contained HTML document with the
+    expected selectors used by the evaluator.
+    """
+    # Summarize attachments in a JSON-like manifest the model can act on.
+    att_manifest: Dict[str, str] = {}
+    for name, data in (attachments or {}).items():
+        # Only include small samples (cap size) to avoid massive prompts
+        sample = data[:2048]
+        att_manifest[name] = base64.b64encode(sample).decode("ascii")
 
-def gen_captcha_solver(img_bytes: bytes | None) -> str:
-    """Captcha OCR template using Tesseract.js with 14s timeout and ?url= override."""
-    fallback = base64.b64encode(img_bytes or b"").decode("ascii")
-    tpl = """
-<!doctype html><meta charset=utf-8>
-<title>Captcha Solver</title>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-<div class="container" style="max-width:720px;margin:2rem auto">
-  <h1>Captcha Solver</h1>
-  <img id="cap" style="max-width:100%"/>
-  <pre id="out"></pre>
-</div>
-<script>
-const p=new URLSearchParams(location.search);
-const url=p.get('url');
-const img=url||'data:image/png;base64,%%FALLBACK%%';
-document.getElementById('cap').src=img;
-(async()=>{
-  const o=document.getElementById('out');
-  const ctrl = new AbortController(); const t=setTimeout(()=>ctrl.abort('timeout'), 14000);
-  try {
-    const res = await Tesseract.recognize(img, 'eng', { logger: m=>o.textContent = (m.status||'')+ ' '+ (m.progress||'') });
-    clearTimeout(t); o.textContent = (res.data.text||'').trim();
-  } catch(e) { o.textContent = 'error'; }
-})();
-</script>
-"""
-    return fill_tokens(tpl, {"FALLBACK": fallback})
-
-
-def pick_generator(brief: str, attachments: dict[str, bytes], seed: str) -> str:
-    """Pick a generator based on keywords in the brief with sensible fallbacks."""
+    hints = []
     b = (brief or "").lower()
-    if ("sum-of-sales" in b) or ("sales" in b and "+bootstrap" in b):
-        csv = attachments.get("data.csv", b"product,sales\na,1\n")
-        return gen_sum_of_sales(seed, csv, 0.0)
+    if ("sum-of-sales" in b) or ("sales" in b):
+        hints.append(
+            "- Sales: Include Bootstrap 5. Compute CSV last-column sum into #total-sales."
+        )
     if ("markdown-to-html" in b) or ("markdown" in b):
-        md = attachments.get("input.md", b"# Title\n\nHello")
-        return gen_markdown_to_html(md)
+        hints.append(
+            "- Markdown: Use marked + highlight.js. Render into #markdown-output; show #markdown-source-label and #markdown-word-count using Intl.NumberFormat; support ?url= fallback to embedded attachment."
+        )
     if ("github-user" in b) or ("github username" in b):
-        return gen_github_user(seed)
+        hints.append(
+            f"- GitHub user: Form id=\"github-user-{seed}\"; fetch https://api.github.com/users/<name>; write ISO date to #github-created-at; aria-live #github-status; years into #github-account-age; cache in localStorage."
+        )
     if "captcha" in b:
-        img = attachments.get("sample.png")
-        return gen_captcha_solver(img)
-    return f"<h1>{brief}</h1>"
+        hints.append(
+            "- Captcha: Use Tesseract.js v5 via CDN; support ?url=; fallback to embedded PNG data URI; print solved text within 15s."
+        )
+    # Incorporate explicit checks as additional implementation hints
+    for chk in _normalize_checks(checks):
+        hints.append(f"CHECK: {chk}")
+
+    if not hints:
+        hints.append("- Fallback: Echo the brief in an <h1> and include basic Bootstrap.")
+
+    prompt = f"""
+You are an expert frontend engineer. Produce a single, self-contained HTML file (no external build step) that satisfies the brief below and passes basic selector checks. Follow these strict rules:
+
+- Output ONLY raw HTML. Do not include markdown code fences.
+- Use plain HTML/CSS/JS with CDN scripts when needed. No frameworks besides allowed CDNs.
+- The page must be static and run fully in the browser.
+- Use seed = {seed} when constructing any required element IDs.
+- If attachments are referenced below, embed their content as base64 strings and decode in JS at runtime.
+
+Brief: {brief}
+Task: {task}
+
+Attachments (name -> base64_sample):
+{json.dumps(att_manifest, indent=2)}
+
+Implementation hints:
+{chr(10).join(hints)}
+
+Important:
+- Include <!doctype html> and a <meta charset="utf-8">.
+- Ensure the specified element IDs exist and are populated appropriately.
+- If using external scripts: use jsDelivr for Bootstrap 5, marked, highlight.js, or Tesseract.js when applicable.
+- Ensure the page remains functional without any server.
+""".strip()
+
+    return prompt
+
+
+def llm_generate_static_html(task: str, brief: str, seed: str, attachments: dict[str, bytes], checks: Any | None = None) -> tuple[str | None, str]:
+    """Call an OpenAI-compatible chat completion endpoint to generate HTML.
+
+    Returns a tuple (html, prompt_used). If the call fails or output empty,
+    returns (None, prompt_used).
+    """
+    prompt = build_llm_prompt(task, brief, seed, attachments, checks)
+
+    if not API_KEY:
+        return None, prompt
+
+    url = f"{API_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": API_MODEL,
+        "messages": [
+            {"role": "system", "content": "You generate production-ready, self-contained static HTML only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 4096,
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=HTTP_TIMEOUT)
+        if r.status_code >= 300:
+            # Let caller fall back to deterministic templates
+            return None, prompt
+        data = r.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        html = _extract_html(content)
+        if html and ("<html" in html.lower() or "<!doctype" in html.lower() or "<body" in html.lower()):
+            return html, prompt
+        return None, prompt
+    except Exception:
+        return None, prompt
+
+
+def generate_index_html(brief: str, attachments: dict[str, bytes], seed: str, task: str, checks: Any | None = None) -> tuple[str, str]:
+    """Try the LLM-backed generator first; fall back to deterministic templates.
+
+    Returns (index_html, prompt_used).
+    """
+    html, prompt = llm_generate_static_html(task, brief, seed, attachments, checks)
+    if html:
+        return html, prompt
+    # Fallback: minimal static page echoing the brief
+    fallback_html = f"""
+<!doctype html><meta charset="utf-8">
+<title>Fallback App</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5/dist/css/bootstrap.min.css">
+<div class="container py-4">
+  <h1>{brief}</h1>
+  <p>Seed: {seed}</p>
+  <p>This fallback rendered because the LLM call was unavailable.</p>
+  <div id="status" class="visually-hidden" aria-live="polite"></div>
+  <div id="content"></div>
+  <script>document.getElementById('status').textContent='ready';</script>
+</div>
+"""
+    fallback_prompt = (
+        "LLM call failed or API_KEY missing; returned minimal static fallback."
+    )
+    return fallback_html, fallback_prompt
 
 
 # ---------- Git plumbing ----------
 def commit_and_push(repo: str, files: dict[str, str | bytes]) -> str:
-    """Create a temp repo, write files, push to GitHub, and return commit SHA."""
+    """Clone (if exists) or init repo, write files, push to GitHub, return commit SHA.
+
+    Preserves history on round-2 by cloning and committing on top of origin/main.
+    Falls back to rebase on rejection, then --force-with-lease as last resort.
+    """
+    remote = f"https://x-access-token:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{repo}.git"
+    ensure_repo_public(repo)
+    ensure_pages_enabled(repo)
+
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        run(["git", "init", "-b", "main"], cwd=td_path)
+
+        cloned = False
+        try:
+            # Clone shallow if repo already has content
+            run(["git", "clone", "--depth", "1", remote, "."], cwd=td_path)
+            cloned = True
+        except Exception:
+            # Likely an empty repo or transient network; fall back to init
+            run(["git", "init", "-b", "main"], cwd=td_path)
+            run(["git", "remote", "add", "origin", remote], cwd=td_path)
+
+        # Identity
         run(["git", "config", "user.email", GITHUB_EMAIL], cwd=td_path)
         run(["git", "config", "user.name", GITHUB_USERNAME], cwd=td_path)
+
+        # Ensure we're on a main branch tracking origin/main when available
+        if cloned:
+            try:
+                run(["git", "checkout", "-B", "main", "origin/main"], cwd=td_path)
+            except Exception:
+                run(["git", "checkout", "-B", "main"], cwd=td_path)
+        else:
+            # Newly initialized repository
+            run(["git", "checkout", "-B", "main"], cwd=td_path)
+
+        # Write/overwrite files
         for path, content in files.items():
             write_file(td_path, path, content)
-        # MIT, gitleaks, workflow
         write_file(td_path, "LICENSE", MIT.format(year=time.strftime('%Y'), user=GITHUB_USERNAME))
         write_file(td_path, ".github/workflows/pages.yml", PAGES_WORKFLOW)
         write_file(td_path, ".gitleaks.toml", GITLEAKS)
+
+        # Commit
         run(["git", "add", "."], cwd=td_path)
-        run(["git", "commit", "-m", "init"], cwd=td_path)
-        # push via HTTPS PAT; use x-access-token scheme
-        remote = f"https://x-access-token:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{repo}.git"
-        ensure_repo_public(repo)
-        ensure_pages_enabled(repo)
-        run(["git", "remote", "add", "origin", remote], cwd=td_path)
-        run(["git", "push", "-u", "origin", "main"], cwd=td_path)
-    # query latest commit
+        try:
+            run(["git", "commit", "-m", "update"], cwd=td_path)
+        except Exception:
+            # Nothing to commit (no changes); continue to push
+            pass
+
+        # Push with preserve-history strategy
+        try:
+            run(["git", "push", "-u", "origin", "main"], cwd=td_path)
+        except Exception:
+            try:
+                # Try fetch + rebase (fast-forward the local branch)
+                run(["git", "fetch", "origin", "main"], cwd=td_path)
+                run(["git", "rebase", "origin/main"], cwd=td_path)
+                run(["git", "push", "-u", "origin", "main"], cwd=td_path)
+            except Exception:
+                # Last resort to avoid repeated failures in CI races
+                run(["git", "push", "--force-with-lease", "-u", "origin", "main"], cwd=td_path)
+
+    # Query latest commit
     data = gh_api("GET", f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/commits/main")
     return data["sha"]
 
@@ -461,10 +531,11 @@ async def handle(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Server misconfigured; missing env: {', '.join(missing)}")
 
     attachments = decode_attachments(body.get("attachments"))
+    checks = body.get("checks")
 
     repo = safe_repo_name(task)
     seed = (email or "user").split("@")[0]
-    index_html = pick_generator(brief, attachments, seed)
+    index_html, llm_prompt_text = generate_index_html(brief, attachments, seed, task, checks)
 
     # Compose README content (kept minimal to match checks)
     readme = (
@@ -477,7 +548,7 @@ async def handle(request: Request, background_tasks: BackgroundTasks):
         "- Attachments (if any) decoded from data URIs.\n"
         "- Minimal JS implements checks.\n\n"
         "## LLM prompt excerpt\n"
-        f"> Build a minimal, standards-compliant static app passing the evaluation checks for: `{task}`.\n\n"
+        + (llm_prompt_text or "(no LLM prompt recorded)") + "\n\n"
         "## License\nMIT\n"
     )
 
